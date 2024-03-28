@@ -11,7 +11,8 @@ python benchmark/perplexity.py --experiment transformers
 python benchmark/perplexity.py --experiment windowed
 """
 
-
+import sys
+import os
 import argparse
 import itertools
 import time
@@ -173,7 +174,12 @@ def main():
 
     # Initialize the model,  via self_extended, transformers or via attention_sinks
     if  args.experiment == "self_extended":
-        import SelfExtend 
+        # Get the absolute path of the grandparent directory
+        grandparent_dir = os.path.abspath(os.path.join(os.getcwd(), '..', '..'))
+        # Add the grandparent directory to the Python path
+        sys.path.insert(0, grandparent_dir)
+        import SelfExtend
+        
         model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
         SelfExtend.apply(model, args.group_size, args.window_size, enable_flash_attention=args.use_flash) 
     else: 
