@@ -27,14 +27,44 @@ from torch.nn import CrossEntropyLoss
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers import AutoModelForCausalLM
+import logging
+
+
+# Set up logging
+def setup_logging(experiment: str, output_dir: str) -> logging.Logger:
+    logger = logging.getLogger(experiment)
+    logger.setLevel(logging.INFO)
+    log_file = Path(output_dir) / f"{experiment}.log"
+    file_handler = logging.FileHandler(log_file)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    return logger
+
+
 
 # calculate perplexity using a sliding window
 def compute_perplexity_sliding_window(
     model,
     encodings,
+    experiment: str,
     context_max_length: Optional[int] = 2048,
     stride: Optional[int] = 512,
+    output_dir: str = "outputs",
+    overwrite: bool = False,
 ) -> float:
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # output_file = output_dir / f"{experiment}.csv"
+    
+    # Initialize logging
+    logger = setup_logging(experiment, output_dir)
+
+    # if output_file.exists() and not overwrite:
+    #     raise ValueError(
+    #         f"The {output_file!r} output file already exists - if you really want to override it, then use `--overwrite`."
+    #     )
 
     # For long sequences, we process in chunks
     seq_len = encodings.input_ids.size(1)
@@ -64,12 +94,15 @@ def compute_perplexity_sliding_window(
             break
 
     ppl = float(torch.exp(torch.stack(nlls).mean()).item())
-    gpu_memory = torch.cuda.memory_allocated(1) / 1024 / 1024 / 1024  # in GB
+    # gpu_memory = torch.cuda.memory_allocated(1) / 1024 / 1024 / 1024  # in GB
     end_t = time.time()
+
+    logger.info(f"Time taken: {end_t - start_t:.2f} seconds")
+    logger.info(f"PPL: {ppl:.2f}")
 
     print(f"Time taken: {end_t - start_t:.2f} seconds")
     print(f"PPL: {ppl:.2f}")
-    print(f"GPU Memory Used: {gpu_memory:.2f} GB")
+    # print(f"GPU Memory Used: {gpu_memory:.2f} GB")
 
     return ppl
 
@@ -142,10 +175,11 @@ def compute_perplexity_per_token(
 
 def main():
     parser = argparse.ArgumentParser()
-    # Which experiment to run?
+    # experiment seeeting
     parser.add_argument(
-        "--experiment", choices=["transformers", "self_extended"], default="transformers"
+        "--experiment", choices=["transformers", "self_extended", "self_extended_sw"], default="transformers"
     )
+    parser.add_argument("--device", type=int, default=0)
 
     # Model args
     parser.add_argument("--model_name_or_path", type=str, default="meta-llama/Llama-2-7b-hf")
@@ -157,25 +191,29 @@ def main():
     parser.add_argument("--data_column", type=str, default="text")
     parser.add_argument("--task", type=str, default=None)
     parser.add_argument("--split", type=str, default="test", choices=["validation", "test"])
-    # parser.add_argument("--num_samples", type=int, default=1)
     parser.add_argument("--num_tokens", type=int, default=8192)
 
     # Where to log
-    parser.add_argument("--output_dir", type=str, default="benchmark/outputs")
+    parser.add_argument("--output_dir", type=str, default="/home/jr151/code/LongLM/evaluation/ppl_benchmark/outputs/llama_2_7b")
     parser.add_argument("--overwrite", action="store_true")
 
-
     # Self Extended settings
-    parser.add_argument("--group_size", type=int, default=32)
+    parser.add_argument("--group_size", type=int, default=8)            # for ppl test, group size was set to 8
     parser.add_argument("--use_flash", type=bool, default=True)
+
+    # Sliding window settings
     parser.add_argument("--window_size", type=int, default=1024)
+    parser.add_argument("--stride", type=int, default=256)
 
     args = parser.parse_args()
 
+    # Set up the dataset
+    dataset = load_dataset(args.dataset_name, split=args.split)
+    
     # Initialize the model,  via self_extended, transformers or via attention_sinks
-    if  args.experiment == "self_extended":
+    if  "self_extended" in args.experiment:
         # Get the absolute path of the grandparent directory
-        grandparent_dir = os.path.abspath(os.path.join(os.getcwd(), '..', '..'))
+        grandparent_dir = "/home/jr151/code/LongLM"
         # Add the grandparent directory to the Python path
         sys.path.insert(0, grandparent_dir)
         import SelfExtend
@@ -190,28 +228,32 @@ def main():
             trust_remote_code=bool(args.trust_remote_code),
             torch_dtype=torch.float16,
             # attn_implementation="flash_attention_2",
-            max_position_embeddings = 16384,
+            max_position_embeddings = args.num_tokens,
         )
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=bool(args.trust_remote_code))
 
-    # Set up the dataset
-    dataset = load_dataset(args.dataset_name, args.task, split=args.split, streaming=True)
 
-    compute_perplexity_per_token(
-        model,
-        tokenizer,
-        dataset,
-        args.experiment,
-        output_dir=args.output_dir,
-        data_column=args.data_column,
-        num_samples=1,  # <- No support for more than one instance now
-        num_tokens=args.num_tokens,
-        overwrite=args.overwrite,
-    )
+    # compute_perplexity_per_token(
+    #     model,
+    #     tokenizer,
+    #     dataset,
+    #     args.experiment,
+    #     output_dir=args.output_dir,
+    #     data_column=args.data_column,
+    #     num_samples=1,  # <- No support for more than one instance now
+    #     num_tokens=args.num_tokens,
+    #     overwrite=args.overwrite,
+    # )
+
+    # Test sliding window
+    if args.experiment == "self_extended_sw":
+        encodings = tokenizer("\n\n".join(dataset["text"]), return_tensors="pt")
+        compute_perplexity_sliding_window(model, encodings, context_max_length=args.num_tokens, stride=args.stride, experiment=args.experiment, output_dir=args.output_dir, overwrite=args.overwrite)
+
 
 
 if __name__ == "__main__":
